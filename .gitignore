@@ -1,0 +1,21 @@
+# Ignore local agent and claude files
+AGENTS.md
+CLAUDE.md
+
+# Ignore cache files
+__pycache__/
+
+# macOS specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.TemporaryItems
+.VolumeIcon.icns
+.apdisk
+
+# Temporary files and backups
+*.swp
+*~
+.DS_Store
