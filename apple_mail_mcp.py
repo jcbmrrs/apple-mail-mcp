@@ -13,8 +13,9 @@ import sqlite3
 import os
 import email
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
 import logging
 
 # ====================================================================
@@ -37,6 +38,11 @@ MAIL_VERSION = "V10"
 # Envelope database name (usually "Envelope Index")
 ENVELOPE_DB_NAME = "Envelope Index"
 
+# Timezone for displaying email timestamps
+# Use IANA timezone names (e.g., "America/Los_Angeles", "America/New_York", "America/Chicago", "Europe/London")
+# See: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+TIMEZONE = "America/Los_Angeles"
+
 # MCP Server configuration
 MCP_SERVER_NAME = "apple-mail-mcp"
 MCP_SERVER_VERSION = "1.0.0"
@@ -58,11 +64,20 @@ class AppleMailMCPServer:
         self.mail_version = MAIL_VERSION
         self.envelope_db_name = ENVELOPE_DB_NAME
         self.primary_email = PRIMARY_EMAIL_ADDRESS
+        self.timezone = TIMEZONE
 
         # Validate configuration
         if not self.mail_dir.exists():
             logger.warning(f"Mail directory not found: {self.mail_dir}")
             logger.warning("Please update MAIL_DIRECTORY in the configuration section")
+
+        # Validate timezone
+        try:
+            ZoneInfo(self.timezone)
+        except Exception as e:
+            logger.warning(f"Invalid timezone '{self.timezone}': {e}")
+            logger.warning("Falling back to America/Los_Angeles. Please update TIMEZONE in the configuration section")
+            self.timezone = "America/Los_Angeles"
 
     def handle_request(self, request):
         """Handle MCP requests"""
@@ -760,6 +775,7 @@ def main():
     logger.info(f"Apple Mail MCP Server started")
     logger.info(f"Mail directory: {MAIL_DIRECTORY}")
     logger.info(f"Primary email: {PRIMARY_EMAIL_ADDRESS}")
+    logger.info(f"Timezone: {server.timezone}")
 
     try:
         while True:
