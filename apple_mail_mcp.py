@@ -13,8 +13,9 @@ import sqlite3
 import os
 import email
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
 import logging
 
 # ====================================================================
@@ -37,6 +38,11 @@ MAIL_VERSION = "V10"
 # Envelope database name (usually "Envelope Index")
 ENVELOPE_DB_NAME = "Envelope Index"
 
+# Timezone for displaying email timestamps
+# Use IANA timezone names (e.g., "America/Los_Angeles", "America/New_York", "America/Chicago", "Europe/London")
+# See: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+TIMEZONE = "America/Los_Angeles"
+
 # MCP Server configuration
 MCP_SERVER_NAME = "apple-mail-mcp"
 MCP_SERVER_VERSION = "1.0.0"
@@ -58,11 +64,20 @@ class AppleMailMCPServer:
         self.mail_version = MAIL_VERSION
         self.envelope_db_name = ENVELOPE_DB_NAME
         self.primary_email = PRIMARY_EMAIL_ADDRESS
+        self.timezone = TIMEZONE
 
         # Validate configuration
         if not self.mail_dir.exists():
             logger.warning(f"Mail directory not found: {self.mail_dir}")
             logger.warning("Please update MAIL_DIRECTORY in the configuration section")
+
+        # Validate timezone
+        try:
+            ZoneInfo(self.timezone)
+        except Exception as e:
+            logger.warning(f"Invalid timezone '{self.timezone}': {e}")
+            logger.warning("Falling back to America/Los_Angeles. Please update TIMEZONE in the configuration section")
+            self.timezone = "America/Los_Angeles"
 
     def handle_request(self, request):
         """Handle MCP requests"""
@@ -186,6 +201,24 @@ class AppleMailMCPServer:
                                     }
                                 }
                             }
+                        },
+                        {
+                            "name": "mail_get_received_emails",
+                            "description": "Get all emails received on a specific date with full details (subject, sender, recipients)",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "date_filter": {
+                                        "type": "string",
+                                        "description": "Date to search for (YYYY-MM-DD)"
+                                    },
+                                    "limit": {
+                                        "type": "number",
+                                        "description": "Maximum results",
+                                        "default": 20
+                                    }
+                                }
+                            }
                         }
                     ]
                 },
@@ -209,6 +242,8 @@ class AppleMailMCPServer:
                     result = self.find_sent_emails(arguments)
                 elif tool_name == "mail_search_by_subject":
                     result = self.search_by_subject(arguments)
+                elif tool_name == "mail_get_received_emails":
+                    result = self.get_received_emails(arguments)
                 else:
                     return {
                         "jsonrpc": "2.0",
@@ -754,12 +789,146 @@ class AppleMailMCPServer:
         except Exception as e:
             return f"Error searching by subject: {str(e)}"
 
+    def get_received_emails(self, args):
+        """
+        Get all emails received on a specific date with full details.
+
+        Timestamps are displayed in the timezone configured via the TIMEZONE setting.
+        The date_filter is interpreted as being in the configured timezone.
+        """
+        date_filter = args.get("date_filter")
+        limit = args.get("limit", 20)
+
+        if not date_filter:
+            return "Date filter is required (YYYY-MM-DD)"
+
+        db_path = self._get_envelope_db_path()
+
+        if not db_path.exists():
+            return f"Envelope database not found at: {db_path}\nPlease check MAIL_DIRECTORY and MAIL_VERSION configuration"
+
+        try:
+            # Connect read-only
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # Set up configured timezone
+            tz = ZoneInfo(self.timezone)
+
+            result = [f"Emails received on {date_filter} ({self.timezone})"]
+            result.append("")
+
+            # Convert date to timestamp range in configured timezone
+            try:
+                # Parse the date in the configured timezone
+                target_date = datetime.strptime(date_filter, "%Y-%m-%d")
+                target_date_tz = target_date.replace(tzinfo=tz)
+                start_timestamp = int(target_date_tz.timestamp())
+                end_timestamp = int((target_date_tz + timedelta(days=1)).timestamp())
+            except ValueError as e:
+                return f"Invalid date format. Please use YYYY-MM-DD format. Error: {e}"
+
+            # Build query with proper JOINs to get readable information
+            # Note: messages.sender directly references addresses.ROWID
+            sql = """
+                SELECT m.ROWID, m.message_id,
+                       s.subject,
+                       m.date_sent,
+                       m.date_received,
+                       mb.url as mailbox_url,
+                       sender_addr.address as sender_address,
+                       sender_addr.comment as sender_name,
+                       m.read as is_read,
+                       m.flagged as is_flagged
+                FROM messages m
+                LEFT JOIN subjects s ON m.subject = s.ROWID
+                LEFT JOIN mailboxes mb ON m.mailbox = mb.ROWID
+                LEFT JOIN addresses sender_addr ON m.sender = sender_addr.ROWID
+                WHERE m.date_received >= ? AND m.date_received < ?
+                ORDER BY m.date_received DESC
+                LIMIT ?
+            """
+
+            cursor.execute(sql, [start_timestamp, end_timestamp, limit])
+            messages = cursor.fetchall()
+
+            if not messages:
+                result.append("No messages found for this date")
+            else:
+                result.append(f"Found {len(messages)} messages:")
+                result.append("")
+
+                for msg in messages:
+                    result.append(f"{'='*60}")
+                    result.append(f"Message ID: {msg['ROWID']}")
+                    result.append(f"Subject: {msg['subject'] or '(no subject)'}")
+
+                    # Format sender with name if available
+                    sender = msg['sender_address'] or '(unknown)'
+                    if msg['sender_name'] and msg['sender_address']:
+                        sender = f"{msg['sender_name']} <{msg['sender_address']}>"
+                    elif msg['sender_address']:
+                        sender = msg['sender_address']
+                    result.append(f"From: {sender}")
+
+                    # Convert Unix timestamps to configured timezone
+                    if msg['date_received']:
+                        received_dt = datetime.fromtimestamp(msg['date_received'], tz=tz)
+                        result.append(f"Received: {received_dt.strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
+
+                    if msg['date_sent']:
+                        sent_dt = datetime.fromtimestamp(msg['date_sent'], tz=tz)
+                        result.append(f"Sent: {sent_dt.strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
+
+                    result.append(f"Read: {'Yes' if msg['is_read'] else 'No'}")
+                    if msg['is_flagged']:
+                        result.append(f"Flagged: Yes")
+
+                    # Get recipients
+                    cursor.execute("""
+                        SELECT a.address, a.comment, r.type
+                        FROM recipients r
+                        JOIN addresses a ON r.address = a.ROWID
+                        WHERE r.message = ?
+                        ORDER BY r.type, r.position
+                    """, (msg['ROWID'],))
+                    recipients = cursor.fetchall()
+
+                    if recipients:
+                        to_list = []
+                        cc_list = []
+                        for r in recipients:
+                            addr = r['address']
+                            if r['comment']:
+                                addr = f"{r['comment']} <{r['address']}>"
+
+                            if r['type'] == 1:  # To
+                                to_list.append(addr)
+                            elif r['type'] == 2:  # Cc
+                                cc_list.append(addr)
+
+                        if to_list:
+                            result.append(f"To: {', '.join(to_list)}")
+                        if cc_list:
+                            result.append(f"Cc: {', '.join(cc_list)}")
+
+                    result.append(f"Mailbox: {msg['mailbox_url']}")
+                    result.append("")
+
+            conn.close()
+            return "\n".join(result)
+
+        except Exception as e:
+            return f"Error getting received emails: {str(e)}"
+
 def main():
     """Main server loop"""
     server = AppleMailMCPServer()
     logger.info(f"Apple Mail MCP Server started")
     logger.info(f"Mail directory: {MAIL_DIRECTORY}")
     logger.info(f"Primary email: {PRIMARY_EMAIL_ADDRESS}")
+    logger.info(f"Timezone: {server.timezone}")
 
     try:
         while True:
