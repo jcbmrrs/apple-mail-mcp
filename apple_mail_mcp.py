@@ -702,13 +702,11 @@ class AppleMailMCPServer:
                        datetime(m.date_sent, 'unixepoch') as sent_date,
                        datetime(m.date_received, 'unixepoch') as received_date,
                        mb.url as mailbox_url,
-                       m.sender,
                        sender_addr.address as sender_address
                 FROM messages m
                 LEFT JOIN subjects s ON m.subject = s.ROWID
                 LEFT JOIN mailboxes mb ON m.mailbox = mb.ROWID
-                LEFT JOIN sender_addresses sa ON m.sender = sa.sender
-                LEFT JOIN addresses sender_addr ON sa.address = sender_addr.ROWID
+                LEFT JOIN addresses sender_addr ON m.sender = sender_addr.ROWID
                 WHERE """ + " AND ".join(where_conditions) + """
                 ORDER BY m.date_sent DESC, m.date_received DESC
                 LIMIT ?
