@@ -13,7 +13,7 @@ import sqlite3
 import os
 import email
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 import logging
@@ -65,6 +65,7 @@ class AppleMailMCPServer:
         self.envelope_db_name = ENVELOPE_DB_NAME
         self.primary_email = PRIMARY_EMAIL_ADDRESS
         self.timezone = TIMEZONE
+        self.tz = None
 
         # Validate configuration
         if not self.mail_dir.exists():
@@ -73,11 +74,22 @@ class AppleMailMCPServer:
 
         # Validate timezone
         try:
-            ZoneInfo(self.timezone)
+            self.tz = ZoneInfo(self.timezone)
         except Exception as e:
             logger.warning(f"Invalid timezone '{self.timezone}': {e}")
             logger.warning("Falling back to America/Los_Angeles. Please update TIMEZONE in the configuration section")
             self.timezone = "America/Los_Angeles"
+            self.tz = ZoneInfo(self.timezone)
+
+    def _format_ts(self, ts):
+        """Format a Unix timestamp into the configured timezone for display."""
+        if ts is None:
+            return "(no date)"
+        try:
+            dt = datetime.fromtimestamp(ts, tz=self.tz)
+            return dt.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+        except Exception:
+            return str(ts)
 
     def handle_request(self, request):
         """Handle MCP requests"""
@@ -308,8 +320,7 @@ class AppleMailMCPServer:
             # Simple search
             if query:
                 sql = """
-                    SELECT ROWID, subject, sender,
-                           datetime(date_received, 'unixepoch') as date
+                    SELECT ROWID, subject, sender, date_received
                     FROM messages
                     WHERE subject LIKE ? OR sender LIKE ?
                     ORDER BY date_received DESC
@@ -318,8 +329,7 @@ class AppleMailMCPServer:
                 cursor.execute(sql, [f"%{query}%", f"%{query}%", limit])
             else:
                 sql = """
-                    SELECT ROWID, subject, sender,
-                           datetime(date_received, 'unixepoch') as date
+                    SELECT ROWID, subject, sender, date_received
                     FROM messages
                     ORDER BY date_received DESC
                     LIMIT ?
@@ -337,7 +347,7 @@ class AppleMailMCPServer:
                 result.append(f"ID: {msg['ROWID']}")
                 result.append(f"Subject: {msg['subject'] or '(no subject)'}")
                 result.append(f"From: {msg['sender'] or '(unknown)'}")
-                result.append(f"Date: {msg['date']}")
+                result.append(f"Date: {self._format_ts(msg['date_received'])}")
                 result.append("---")
 
             return "\n".join(result)
@@ -464,7 +474,7 @@ class AppleMailMCPServer:
                             date_col = date_columns[0]  # Use first date column found
                             try:
                                 # Convert date to timestamp for comparison
-                                target_date = datetime.strptime(date_filter, "%Y-%m-%d")
+                                target_date = datetime.strptime(date_filter, "%Y-%m-%d").replace(tzinfo=self.tz)
                                 start_timestamp = int(target_date.timestamp())
                                 end_timestamp = int((target_date + timedelta(days=1)).timestamp())
 
@@ -483,11 +493,10 @@ class AppleMailMCPServer:
                             if col in column_names:
                                 select_cols.append(col)
 
-                        # Add date column with readable format
+                        # Add raw date columns for formatting
                         for date_col in ['date_received', 'date_sent']:
                             if date_col in column_names:
-                                select_cols.append(f"datetime({date_col}, 'unixepoch') as {date_col}_readable")
-                                break
+                                select_cols.append(date_col)
 
                         sql = f"SELECT {', '.join(select_cols)} FROM {table_name}"
                         if where_conditions:
@@ -509,9 +518,9 @@ class AppleMailMCPServer:
                                 if 'recipients' in msg.keys():
                                     result.append(f"  To: {msg['recipients'] or '(unknown)'}")
                                 # Show readable date
-                                for key in msg.keys():
-                                    if key.endswith('_readable'):
-                                        result.append(f"  Date: {msg[key]}")
+                                for date_col in ['date_received', 'date_sent']:
+                                    if date_col in msg.keys():
+                                        result.append(f"  Date: {self._format_ts(msg[date_col])}")
                                         break
                                 result.append("  ---")
                         else:
@@ -589,7 +598,7 @@ class AppleMailMCPServer:
             # Add date filter if specified
             if date_filter:
                 try:
-                    target_date = datetime.strptime(date_filter, "%Y-%m-%d")
+                    target_date = datetime.strptime(date_filter, "%Y-%m-%d").replace(tzinfo=self.tz)
                     start_timestamp = int(target_date.timestamp())
                     end_timestamp = int((target_date + timedelta(days=1)).timestamp())
 
@@ -602,8 +611,8 @@ class AppleMailMCPServer:
             # Build the full query
             sql = """
                 SELECT m.ROWID, m.message_id, s.subject,
-                       datetime(m.date_sent, 'unixepoch') as sent_date,
-                       datetime(m.date_received, 'unixepoch') as received_date,
+                       m.date_sent,
+                       m.date_received,
                        mb.url as mailbox_url
                 FROM messages m
                 LEFT JOIN subjects s ON m.subject = s.ROWID
@@ -627,8 +636,8 @@ class AppleMailMCPServer:
                 for msg in sent_messages:
                     result.append(f"Message ID: {msg['ROWID']}")
                     result.append(f"Subject: {msg['subject'] or '(no subject)'}")
-                    result.append(f"Sent Date: {msg['sent_date']}")
-                    result.append(f"Received Date: {msg['received_date']}")
+                    result.append(f"Sent Date: {self._format_ts(msg['date_sent'])}")
+                    result.append(f"Received Date: {self._format_ts(msg['date_received'])}")
                     result.append(f"Mailbox: {msg['mailbox_url']}")
 
                     # Try to find recipients
@@ -701,7 +710,7 @@ class AppleMailMCPServer:
             # Add date filter if specified
             if date_filter:
                 try:
-                    target_date = datetime.strptime(date_filter, "%Y-%m-%d")
+                    target_date = datetime.strptime(date_filter, "%Y-%m-%d").replace(tzinfo=self.tz)
                     start_timestamp = int(target_date.timestamp())
                     end_timestamp = int((target_date + timedelta(days=1)).timestamp())
 
@@ -714,8 +723,8 @@ class AppleMailMCPServer:
             # Build the full query
             sql = """
                 SELECT m.ROWID, m.message_id, s.subject,
-                       datetime(m.date_sent, 'unixepoch') as sent_date,
-                       datetime(m.date_received, 'unixepoch') as received_date,
+                       m.date_sent,
+                       m.date_received,
                        mb.url as mailbox_url,
                        m.sender,
                        sender_addr.address as sender_address
@@ -742,8 +751,8 @@ class AppleMailMCPServer:
                 for msg in messages:
                     result.append(f"Message ID: {msg['ROWID']}")
                     result.append(f"Subject: {msg['subject'] or '(no subject)'}")
-                    result.append(f"Sent Date: {msg['sent_date']}")
-                    result.append(f"Received Date: {msg['received_date']}")
+                    result.append(f"Sent Date: {self._format_ts(msg['date_sent'])}")
+                    result.append(f"Received Date: {self._format_ts(msg['date_received'])}")
                     result.append(f"Sender Address: {msg['sender_address'] or '(unknown)'}")
                     result.append(f"Mailbox: {msg['mailbox_url']}")
 
